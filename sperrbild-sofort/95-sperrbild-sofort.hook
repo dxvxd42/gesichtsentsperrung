@@ -1,0 +1,10 @@
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Path
+Target = usr/share/plasma/shells/org.kde.plasma.desktop/contents/lockscreen/LockScreenUi.qml
+
+[Action]
+Description = Sperrbildschirm: Gesicht/Fingerabdruck sofort starten ...
+When = PostTransaction
+Exec = /usr/local/sbin/sperrbild-sofort-patch

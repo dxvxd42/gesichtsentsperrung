@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+"""Sperrbildschirm „sofort“: Gesicht + Fingerabdruck starten ohne Tastendruck,
+auch direkt nach dem Aufklappen.
+
+Läuft nach jedem Update von plasma-desktop per pacman-Hook und repariert sich selbst:
+  Stufe 1  Eigenen, abgeschlossenen Block in LockScreenUi.qml einfügen. Er ändert keinen
+           KDE-Code, sondern hängt nur Zusätze an das Hauptelement an (braucht nur dessen
+           „id:“-Zeile). Fehlt eine benötigte Funktion, wird der Teil weggelassen.
+  Stufe 2  Ergebnis mit qmllint prüfen. Fehler -> Original sofort zurück.
+  Stufe 3  Ging das nicht: Notlösung einschalten (Merker-Datei). Dann drückt das System
+           nach dem Aufwachen selbst kurz Shift (sperrbild-taste), was den Sperrbildschirm
+           genauso aufweckt wie ein echter Tastendruck. Kein Eingriff in KDE-Dateien.
+Der Benutzer bekommt jeweils eine Desktop-Benachrichtigung.
+
+Aufruf: sperrbild-sofort-patch [--status] [--zurueck] [DATEI]"""
+import os, re, shutil, subprocess, sys, tempfile
+
+DATEI = "/usr/share/plasma/shells/org.kde.plasma.desktop/contents/lockscreen/LockScreenUi.qml"
+QMLTYPES = "/usr/lib/qt6/qml/org/kde/kscreenlocker/kscreenlocker_greet.qmltypes"
+SESSIONTYPES = "/usr/lib/qt6/qml/org/kde/plasma/private/sessions/sessionsprivateplugin.qmltypes"
+QMLLINT = "/usr/lib/qt6/bin/qmllint"
+NOTLOESUNG = "/var/lib/sperrbild-sofort/notloesung"
+ANFANG, ENDE = "// sperrbild-sofort: ANFANG", "// sperrbild-sofort: ENDE"
+
+args = [a for a in sys.argv[1:] if not a.startswith("--")]
+pfad = args[0] if args else DATEI
+testlauf = bool(args)  # eigene Datei angegeben -> keine Merker/Benachrichtigungen
+
+
+def log(msg):
+    print(msg)
+    if not testlauf:
+        subprocess.run(["logger", "-t", "sperrbild-sofort", msg])
+
+
+def melden(dringlich, titel, text):
+    if testlauf:
+        return
+    for d in os.listdir("/run/user"):
+        if d.isdigit() and int(d) >= 1000 and os.path.exists(f"/run/user/{d}/bus"):
+            nutzer = subprocess.run(["id", "-nu", d], capture_output=True, text=True).stdout.strip()
+            subprocess.run(["runuser", "-u", nutzer, "--", "env",
+                            f"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{d}/bus",
+                            "notify-send", "-a", "Gesichtsentsperrung", "-i", "camera-web",
+                            "-u", dringlich, titel, text], capture_output=True)
+
+
+def notloesung(an):
+    if testlauf:
+        return
+    if an:
+        os.makedirs(os.path.dirname(NOTLOESUNG), exist_ok=True)
+        open(NOTLOESUNG, "w").write("an\n")
+    elif os.path.exists(NOTLOESUNG):
+        os.remove(NOTLOESUNG)
+
+
+def lese(p):
+    try:
+        return open(p, encoding="utf-8").read()
+    except OSError:
+        return ""
+
+
+def lint(p):
+    """True, wenn qmllint die Datei akzeptiert (oder qmllint fehlt -> nur Klammer-Prüfung)."""
+    if os.path.exists(QMLLINT):
+        r = subprocess.run([QMLLINT, p], capture_output=True, text=True)
+        return r.returncode == 0, (r.stdout + r.stderr)[-1500:]
+    s = lese(p)
+    return s.count("{") == s.count("}"), "qmllint fehlt, nur Klammern geprüft"
+
+
+def entferne_block(src):
+    return re.sub(r"\n[ \t]*" + re.escape(ANFANG) + r".*?" + re.escape(ENDE) + r"[^\n]*", "", src, flags=re.S)
+
+
+def baue_block(src, wurzel, ind):
+    # Nur ein Herzschlag: startet die Anmeldung sofort und hält sie am Laufen, auch ohne
+    # sichtbare Oberfläche (z. B. direkt nach dem Aufklappen). Bewusst KEIN stopAuthenticating:
+    # das beendet den Anmeldedienst endgültig (15.11.: danach ging nicht mal das Passwort).
+    api = lese(QMLTYPES)
+    if not re.search(r"\bauthenticator\.", src) or 'name: "startAuthenticating"' not in api \
+            or 'name: "unlocked"' not in api:
+        return None, ["authenticator/startAuthenticating"]
+    text = f"""{ANFANG} Gesicht/Fingerabdruck sofort, automatisch eingefügt
+Timer {{ // Herzschlag: Anmeldung läuft immer, auch ohne sichtbare Oberfläche
+    interval: 1000
+    repeat: true
+    triggeredOnStart: true
+    running: !authenticator.unlocked
+    onTriggered: authenticator.startAuthenticating()
+}}
+{ENDE}"""
+    return "\n" + "\n".join((ind + z) if z.strip() else z for z in text.split("\n")) + "\n", []
+
+
+def patchen():
+    src = entferne_block(lese(pfad))
+    if not src:
+        return False, "Datei nicht lesbar"
+    # Wurzelelement = erste „id:“-Zeile der Datei
+    m = re.search(r"^([ \t]+)id:\s*(\w+)[ \t]*\n", src, re.M)
+    if not m:
+        return False, "keine id-Zeile des Hauptelements gefunden"
+    block, fehlt = baue_block(src, m.group(2), m.group(1))
+    if block is None:
+        return False, "benötigte Funktion fehlt: " + ", ".join(fehlt)
+    neu = src[:m.end()] + block + src[m.end():]
+
+    # Stufe 2: erst als Testdatei im selben Ordner prüfen (gleiche Importe/qmldir)
+    fd, tmp = tempfile.mkstemp(suffix=".qml", prefix=".sofort-test-", dir=os.path.dirname(pfad))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(neu)
+        ok, ausgabe = lint(tmp)
+    finally:
+        os.remove(tmp)
+    if not ok:
+        return False, "Prüfung (qmllint) fehlgeschlagen:\n" + ausgabe
+    if not os.path.exists(pfad + ".orig") or ANFANG not in lese(pfad):
+        shutil.copy2(pfad, pfad + ".orig")
+    open(pfad, "w", encoding="utf-8").write(neu)
+    return True, ("ohne: " + ", ".join(fehlt)) if fehlt else "vollständig"
+
+
+def main():
+    if "--status" in sys.argv:
+        print("Anpassung:", "aktiv" if ANFANG in lese(pfad) else "NICHT aktiv")
+        print("Notlösung (Shift nach Aufwachen):", "an" if os.path.exists(NOTLOESUNG) else "aus")
+        return 0
+    if "--zurueck" in sys.argv:
+        if os.path.exists(pfad + ".orig"):
+            shutil.move(pfad + ".orig", pfad)
+        notloesung(False)
+        log("Sperrbildschirm-Anpassung entfernt.")
+        return 0
+
+    vorher = ANFANG in lese(pfad)
+    try:
+        ok, info = patchen()
+    except Exception as e:  # nie ein Update kaputt machen
+        ok, info = False, f"Fehler: {e}"
+    if ok:
+        log(f"Sperrbildschirm angepasst ({info}).")
+        notloesung(False)
+        if info != "vollständig":
+            melden("normal", "Sperrbildschirm teilweise angepasst",
+                   f"KDE hat den Sperrbildschirm geändert, ein Teil ging nicht ({info}). Gesicht/Fingerabdruck starten trotzdem sofort.")
+        return 0
+
+    # Stufe 3: Original sicherstellen + Notlösung
+    if os.path.exists(pfad + ".orig") and ANFANG in lese(pfad):
+        shutil.copy2(pfad + ".orig", pfad)
+    notloesung(True)
+    log("Anpassung nicht möglich, Notlösung aktiv. Grund: " + info)
+    melden("normal" if not vorher else "critical", "Sperrbildschirm: Notlösung aktiv",
+           "KDE hat den Sperrbildschirm umgebaut. Nach dem Aufklappen wird jetzt automatisch kurz "
+           "Shift gedrückt, damit Gesicht/Fingerabdruck starten. Details: journalctl -t sperrbild-sofort")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

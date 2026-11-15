@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+# Prüft, ob Gesichtsentsperrung (Howdy) und IR-Leuchte nach Updates noch funktionieren,
+# und baut kaputte selbstgebaute Pakete aus ~/aur neu.
+#
+#   gesicht-reparatur --pruefen   nur prüfen (ohne root), Exit 0 = alles ok
+#   gesicht-reparatur             prüfen + reparieren (als root, z. B. über den systemd-Dienst)
+set -uo pipefail
+
+BENUTZER=__BENUTZER__   # wird von installieren.sh durch den eigenen Benutzernamen ersetzt
+AUR=/home/$BENUTZER/aur
+LOG=/var/log/gesicht-reparatur.log
+
+kaputt=()   # Liste der neu zu bauenden Pakete (Ordnernamen in ~/aur)
+gruende=()
+
+fehlende_libs() {  # gibt fehlende Bibliotheken einer Datei aus
+  ldd "$1" 2>/dev/null | awk '/not found/{print $1}'
+}
+
+pruefen() {
+  kaputt=(); gruende=()
+
+  # 1) python-dlib: muss mit dem aktuellen Python importierbar sein
+  if ! python -I -c "import dlib" 2>/dev/null; then
+    kaputt+=(python-dlib); gruende+=("python-dlib lässt sich mit $(python -V 2>&1) nicht laden")
+  fi
+
+  # 2) Howdy: Python-Teil (cv2 + dlib) und PAM-Modul
+  if [[ ! -e /usr/lib/security/pam_howdy.so ]]; then
+    kaputt+=(howdy-git); gruende+=("pam_howdy.so fehlt")
+  else
+    local f; f=$(fehlende_libs /usr/lib/security/pam_howdy.so)
+    [[ -n $f ]] && { kaputt+=(howdy-git); gruende+=("pam_howdy.so: fehlende Bibliotheken: $f"); }
+  fi
+  if ! python -I -c "import cv2" 2>/dev/null; then
+    gruende+=("python-opencv (offizielles Paket) lässt sich nicht laden – kein Neubau möglich")
+  fi
+
+  # 3) IR-Leuchte: Programm muss alle Bibliotheken finden
+  local b=/usr/bin/linux-enable-ir-emitter
+  if [[ ! -x $b ]]; then
+    kaputt+=(linux-enable-ir-emitter); gruende+=("linux-enable-ir-emitter fehlt")
+  else
+    local f; f=$(fehlende_libs "$b")
+    [[ -n $f ]] && { kaputt+=(linux-enable-ir-emitter); gruende+=("IR-Leuchte: fehlende Bibliotheken: $f"); }
+  fi
+
+  # 4) IR-Dienst darf nicht fehlgeschlagen sein
+  if systemctl is-failed --quiet linux-enable-ir-emitter.service; then
+    gruende+=("Dienst linux-enable-ir-emitter ist fehlgeschlagen")
+    [[ " ${kaputt[*]} " == *" linux-enable-ir-emitter "* ]] || kaputt+=(linux-enable-ir-emitter)
+  fi
+
+  [[ ${#gruende[@]} -eq 0 ]]
+}
+
+melden() {  # Desktop-Benachrichtigung an den Benutzer: $1 = Dringlichkeit, $2 = Titel, $3 = Text
+  local uid; uid=$(id -u "$BENUTZER")
+  [[ -S /run/user/$uid/bus ]] || return 0
+  runuser -u "$BENUTZER" -- env DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+    notify-send -a "Gesichtsentsperrung" -i camera-web -u "$1" "$2" "$3" 2>/dev/null || true
+}
+
+ausgabe_gruende() { local g; for g in "${gruende[@]}"; do echo "  - $g"; done; }
+
+# ---------- nur prüfen ----------
+if [[ ${1:-} == --pruefen ]]; then
+  if pruefen; then echo "Gesichtsentsperrung: alles in Ordnung."; exit 0; fi
+  echo "Gesichtsentsperrung: Probleme gefunden:"; ausgabe_gruende
+  [[ ${#kaputt[@]} -gt 0 ]] && echo "Neu zu bauen: ${kaputt[*]}"
+  exit 1
+fi
+
+# ---------- prüfen + reparieren (root) ----------
+if [[ $EUID -ne 0 ]]; then
+  echo "Zum Reparieren: sudo systemctl start gesicht-reparatur   (oder --pruefen zum nur Prüfen)"; exit 2
+fi
+exec >>"$LOG" 2>&1
+echo; echo "===== $(date '+%F %T') Prüfung ====="
+
+# Warten, bis pacman fertig ist (der Dienst wird aus einem pacman-Hook gestartet)
+for _ in $(seq 600); do [[ -e /var/lib/pacman/db.lck ]] || break; sleep 1; done
+if [[ -e /var/lib/pacman/db.lck ]]; then echo "pacman ist nach 10 min noch gesperrt – Abbruch."; exit 1; fi
+
+if pruefen; then echo "Alles in Ordnung."; exit 0; fi
+echo "Probleme:"; ausgabe_gruende
+
+if [[ ${#kaputt[@]} -eq 0 ]]; then
+  melden critical "Gesichtsentsperrung gestört" "$(printf '%s\n' "${gruende[@]}")
+Kein automatischer Neubau möglich – bitte Claude fragen. Passwort funktioniert weiterhin."
+  exit 1
+fi
+
+melden normal "Gesichtsentsperrung wird repariert" "Nach dem Update wird neu gebaut: ${kaputt[*]}. Das dauert ein paar Minuten."
+
+# Reihenfolge: dlib zuerst (Howdy braucht es)
+fehler=0
+for p in python-dlib howdy-git linux-enable-ir-emitter; do
+  [[ " ${kaputt[*]} " == *" $p "* ]] || continue
+  echo "--- baue $p"
+  dir=$AUR/$p
+  # fehlende Bau-Abhängigkeiten nachinstallieren
+  mapfile -t deps < <(runuser -u "$BENUTZER" -- bash -c "cd '$dir' && source PKGBUILD && printf '%s\n' \"\${depends[@]}\" \"\${makedepends[@]}\"")
+  mapfile -t fehlend < <(pacman -T "${deps[@]}")
+  if [[ ${#fehlend[@]} -gt 0 ]]; then
+    echo "installiere Bau-Abhängigkeiten: ${fehlend[*]}"
+    pacman -S --needed --asdeps --noconfirm "${fehlend[@]}" || { fehler=1; continue; }
+  fi
+  rm -f "$dir"/*.pkg.tar.zst
+  if ! runuser -u "$BENUTZER" -- env HOME=/home/$BENUTZER bash -c "cd '$dir' && makepkg -f --noconfirm --cleanbuild"; then
+    echo "Bau von $p fehlgeschlagen"; fehler=1; continue
+  fi
+  pkgs=("$dir"/*.pkg.tar.zst)
+  pacman -U --noconfirm "${pkgs[@]}" || fehler=1
+done
+
+systemctl restart linux-enable-ir-emitter.service || true
+
+if [[ $fehler -eq 0 ]] && pruefen; then
+  echo "Reparatur erfolgreich."
+  melden normal "Gesichtsentsperrung repariert" "Neu gebaut: ${kaputt[*]}. Alles läuft wieder."
+else
+  echo "Reparatur NICHT erfolgreich:"; ausgabe_gruende
+  melden critical "Gesichtsentsperrung: Reparatur fehlgeschlagen" "Details: $LOG – bitte Claude fragen. Passwort funktioniert weiterhin."
+  exit 1
+fi

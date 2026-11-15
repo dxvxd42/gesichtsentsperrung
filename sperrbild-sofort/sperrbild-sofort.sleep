@@ -1,0 +1,6 @@
+#!/bin/sh
+# Notlösung (nur aktiv, wenn sperrbild-sofort-patch die KDE-Datei nicht anpassen konnte):
+# nach dem Aufwachen kurz Shift drücken, damit der Sperrbildschirm Gesicht/Fingerabdruck startet.
+[ "$1" = post ] || exit 0
+[ -f /var/lib/sperrbild-sofort/notloesung ] || exit 0
+systemd-run --no-block --collect --quiet /usr/local/sbin/sperrbild-taste --warten 2

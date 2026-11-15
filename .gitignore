@@ -1,0 +1,10 @@
+# AUR-Arbeitsordner (eigene Git-Klone, Quellen, Bauprodukte) – die verwendeten
+# PKGBUILDs liegen als Kopie in pkgbuilds/
+/howdy/
+/howdy-git/
+/linux-enable-ir-emitter/
+/python-dlib/
+*.pkg.tar.zst
+*.tar.gz
+src/
+pkg/

@@ -1,0 +1,10 @@
+[Unit]
+Description=Gesichtsentsperrung nach Updates prüfen und ggf. neu bauen
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/gesicht-reparatur
+TimeoutStartSec=2h
+Nice=10
