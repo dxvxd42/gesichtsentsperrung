@@ -18,7 +18,7 @@ systemctl is-failed --quiet linux-enable-ir-emitter && { echo "Dienst fehlgeschl
 echo "== 2/5 Howdy auf IR-Kamera einstellen =="
 sudo sed -i \
   -e "s|^device_path = .*|device_path = $IRDEV|" \
-  -e "s|^dark_threshold = .*|dark_threshold = 90|" \
+  -e "s|^dark_threshold = .*|dark_threshold = 99|" \
   /etc/howdy/config.ini
 sudo grep -E '^(device_path|dark_threshold) ' /etc/howdy/config.ini
 
