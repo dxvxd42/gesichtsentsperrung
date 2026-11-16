@@ -7,7 +7,7 @@ cd "$(dirname "$0")"
 if [[ $EUID -eq 0 ]]; then echo "Bitte ohne sudo starten."; exit 1; fi
 
 IRDEV=/dev/v4l/by-path/pci-0000:06:00.0-usb-0:2:1.2-video-index0
-IRCONF="/etc/linux-enable-ir-emitter/pci-0000:06:00.0-usb-0:2:1.2-video-index0.ini"
+IRCONF="/etc/linux-enable-ir-emitter/pci-0000:06:00.0-usb-0:2:1.2-video-index0"   # ohne .ini! (.ini = Sicherung, wird von "run" übersprungen)
 
 echo "== 1/5 IR-Strahler-Einstellung speichern (Befehl 2 100 beim Start) =="
 sudo install -m 644 ir-emitter.ini "$IRCONF"
