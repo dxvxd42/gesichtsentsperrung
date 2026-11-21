@@ -17,6 +17,10 @@ fehlende_libs() {  # gibt fehlende Bibliotheken einer Datei aus
   ldd "$1" 2>/dev/null | awk '/not found/{print $1}'
 }
 
+neustart_ausstehend() {  # laufender Kernel hat keine Module mehr auf der Platte
+  [[ ! -d /usr/lib/modules/$(uname -r) ]]
+}
+
 pruefen() {
   kaputt=(); gruende=()
 
@@ -46,7 +50,11 @@ pruefen() {
   fi
 
   # 4) IR-Dienst darf nicht fehlgeschlagen sein
-  if systemctl is-failed --quiet linux-enable-ir-emitter.service; then
+  #    Ausnahme: Kernel wurde aktualisiert und noch nicht neu gestartet – dann fehlen die
+  #    Module des laufenden Kernels (modprobe uvcvideo schlägt fehl), das ist kein Defekt.
+  if neustart_ausstehend; then
+    echo "Hinweis: Kernel-Update, Neustart ausstehend – Dienst-Status wird erst danach geprüft."
+  elif systemctl is-failed --quiet linux-enable-ir-emitter.service; then
     gruende+=("Dienst linux-enable-ir-emitter ist fehlgeschlagen")
     [[ " ${kaputt[*]} " == *" linux-enable-ir-emitter "* ]] || kaputt+=(linux-enable-ir-emitter)
   fi
@@ -114,7 +122,7 @@ for p in python-dlib howdy-git linux-enable-ir-emitter; do
   pacman -U --noconfirm "${pkgs[@]}" || fehler=1
 done
 
-systemctl restart linux-enable-ir-emitter.service || true
+neustart_ausstehend || systemctl restart linux-enable-ir-emitter.service || true
 
 if [[ $fehler -eq 0 ]] && pruefen; then
   echo "Reparatur erfolgreich."
